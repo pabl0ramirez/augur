@@ -1503,3 +1503,309 @@ def test_nan_cost_prediction_is_unaffordable(monkeypatch):
     monkeypatch.setattr(camp, "_predict", lambda tr: math.nan)
     rep = camp.run()
     assert rep["steps"] == 0
+
+
+# ── review round on the public code, in five parts (db35825d39a4 .. 46701b87e6a6) ───────
+def test_bool_bounce_wait_refused_and_validated_level_is_the_one_stored():
+    with pytest.raises(ValueError, match="bounce_wait_s"):
+        A.BlueQubitEngine(_Client([0.1]), "pauli-path", bounce_wait_s=True)
+    e = A.BlueQubitEngine(_Client([0.1]), "pauli-path", transpilation_level=7,
+                          extra_options={"pauli_path_circuit_transpilation_level": 1})
+    assert e.transpilation_level == 1
+
+
+def test_wait_never_gets_a_spent_deadline_and_jobs_are_cancelled():
+    class _Rec(_Client):
+        def wait(self, job_ids, timeout=None):
+            self.timeouts = getattr(self, "timeouts", []) + [timeout]
+            return super().wait(job_ids, timeout)
+
+    import time as _t
+    cl = _Rec([0.1, 0.2])
+    e = A.BlueQubitEngine(cl, "mps.cpu")
+    with pytest.raises(RuntimeError, match="deadline passed"):
+        e._submit_and_wait(QuantumCircuit(2), [A.parse_observable("Z0", 2)], {}, "n", _t.monotonic() - 1)
+    assert not getattr(cl, "timeouts", []) and cl.cancelled == ["J1"]
+
+
+def test_complex_cloud_expectation_refused_real_complex_accepted():
+    ops = [A.parse_observable("Z0", 2)]
+    bad = _Client([np.array([0.5 + 0.3j])])
+    with pytest.raises(RuntimeError, match="complex expectation"):
+        A.BlueQubitEngine(bad, "pauli-path").run(QuantumCircuit(2), ops, 1e-3)
+    ok = _Client([np.array([0.5 + 0j])])
+    assert A.BlueQubitEngine(ok, "pauli-path").run(QuantumCircuit(2), ops, 1e-3).values == [0.5]
+
+
+def test_malformed_degenerate_flags_raise_and_empty_means_none():
+    assert A._degen(A.Rung("m", 1, [0.1, 0.2], 0.0), 2) == [False, False]
+    with pytest.raises(ValueError, match="1 degenerate flags for 2"):
+        A._degen(A.Rung("m", 1, [0.1, 0.2], 0.0, degenerate=[True]), 2)
+
+
+@pytest.mark.parametrize("ratio", [1.0, 1.5, 0.0, -0.5])
+def test_pps_params_refuse_a_ratio_that_never_ends(ratio):
+    with pytest.raises(ValueError, match="ratio"):
+        A.pps_params(ratio=ratio)
+
+
+def test_fuse_refuses_length_mismatch():
+    with pytest.raises(ValueError, match="exact has 1 values for 2"):
+        A.fuse(2, [], exact=A.Rung("exact", None, [0.1], 0.0))
+    with pytest.raises(ValueError, match="m1 rung None has 1 values for 2"):
+        A.fuse(2, [_lad("m1", [[0.4], [0.4]], [True])])
+
+
+def test_calibrate_gives_a_nan_method_zero_trust():
+    class _Const(A.Engine):
+        def __init__(self, method, v):
+            self.method, self.v = method, v
+
+        def run(self, target, ops, param):
+            return A.Rung(self.method, param, [self.v for _ in ops], 0.01)
+
+    cal = A.calibrate([(None, [None], [0.3])],
+                      [(_Const("good", 0.3), [1, 2], False), (_Const("bad", math.nan), [1, 2], False)])
+    assert cal["trust"]["good"] == 1.0 and cal["trust"]["bad"] == 0.0
+    with pytest.raises(ValueError, match="no method returned finite"):
+        A.calibrate([(None, [None], [0.3])], [(_Const("bad", math.nan), [1, 2], False)])
+
+
+@pytest.mark.parametrize("kw", [{"budget": math.nan}, {"budget": math.inf},
+                                {"budget": 5, "first_rung_guess": math.nan},
+                                {"budget": 5, "trust": {"pps": -1.0}},
+                                {"budget": 5, "trust": {"pps": math.nan}}])
+def test_campaign_refuses_budgets_and_trust_that_never_bind(kw):
+    qc, _ = _ki(n=4, steps=1)
+    with pytest.raises(ValueError):
+        A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, _fake_engines(), log_path=None,
+                   lightcone=False, **kw)
+    with pytest.raises(ValueError, match="at least one engine"):
+        A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [], budget=5, log_path=None,
+                   lightcone=False)
+
+
+def test_wrong_shaped_rung_is_still_charged():
+    class _Short(A.Engine):
+        method = "short"
+
+        def run(self, target, ops, param):
+            return A.Rung(self.method, param, [0.1], 0.5, degenerate=[False])
+
+    qc, _ = _ki(n=4, steps=1)
+    ops = [A.parse_observable("Z0", 4), A.parse_observable("Z1", 4)]
+    rep = A.Campaign({"c": (qc, ops)}, [(_Short(), [1], False)], budget=5, log_path=None,
+                     lightcone=False).run()
+    assert rep["spent"] == pytest.approx(0.5) and rep["steps"] == 1
+
+
+def test_load_log_skips_malformed_rows_and_reports_them(tmp_path):
+    import json as _j
+    qc, _ = _ki(n=4, steps=1)
+    camp = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, _fake_engines(), budget=50,
+                      log_path=None, lightcone=False)
+    good = {"circuit": "c", "method": "pps", "param": 20, "values": [0.8], "elapsed_s": 1.0}
+    rows = ["5", _j.dumps({**good, "values": "x"}), _j.dumps({**good, "values": ["nope"]}),
+            _j.dumps({**good, "degenerate": [True, True]}), _j.dumps({**good, "elapsed_s": "NaN"}),
+            _j.dumps(good)]
+    p = tmp_path / "runs.jsonl"
+    p.write_text("\n".join(rows) + "\n")
+    assert camp.load_log(p) == 1 and camp.spent == pytest.approx(1.0)
+    assert "5 malformed run-log row(s)" in camp.failures[-1]["error"]
+
+
+@pytest.mark.parametrize("patch", [{"budget_usd": "NaN"}, {"budget_usd": "Infinity"},
+                                   {"first_rung_guess_usd": "NaN"}, {"devices": []}])
+def test_day_spec_refuses_non_finite_budgets_and_empty_devices(tmp_path, patch):
+    import json as _j
+    f, _ = _day_spec(tmp_path)
+    text = _j.dumps({**_j.loads(f.read_text()), **patch})
+    f.write_text(text.replace('"NaN"', "NaN").replace('"Infinity"', "Infinity"))
+    with pytest.raises(ValueError):
+        A.load_day_spec(f)
+
+
+def test_day_spec_must_be_an_object(tmp_path):
+    f = tmp_path / "s.json"
+    f.write_text("[1, 2]")
+    with pytest.raises(ValueError, match="JSON object"):
+        A.load_day_spec(f)
+
+
+def test_bench_refuses_an_unknown_family():
+    with pytest.raises(ValueError, match="unknown bench families"):
+        A.bench(families=("kicked_isng",))
+
+
+def test_submission_refuses_a_report_missing_rows(tmp_path):
+    spec = {"circuits": {"c": {"observables": ["Z0", "Z1"]}}}
+    rep = {"circuits": {"c": {"estimates": [{"value": 0.1, "sigma": 0.01, "basis": "agree"}]}}}
+    with pytest.raises(ValueError, match="1 estimates for 2"):
+        A._write_submission(spec, rep, tmp_path / "s.csv")
+
+
+def test_watch_unreadable_consent_spawns_nothing(tmp_path):
+    af = tmp_path / "ARMED.json"
+    af.write_text("{not json")
+    spawned = []
+    r = A.watch(armed_file=af, spawn=lambda s, o: spawned.append(s) or 1, send=_Mail())
+    assert r["state"] == "armed_unreadable" and not spawned
+
+
+def test_watch_survives_corrupt_state_and_shows_failed_alerts(tmp_path):
+    af, out = _armed(tmp_path, hb={"pid": 1, "ts": 0, "steps": 4, "spent": 9, "budget": 10})
+    (out / "watch_state.json").write_text("{corrupt")
+    r = A.watch(armed_file=af, now=lambda: 1e9, alive=lambda p: True, spawn=lambda s, o: 1,
+                send=lambda s, b: (False, "no alert channel configured"))
+    assert r["state"] == "quiet"
+    assert {a["kind"] for a in r["alerts"]} == {"credits80", "quiet"} and not any(a["ok"] for a in r["alerts"])
+
+
+def test_pid_alive_identifies_a_process_owned_by_another_user(monkeypatch):
+    import os
+    import subprocess
+    import sys as _s
+    p = subprocess.Popen([_s.executable, "-c", "import time; time.sleep(5)", "augur", "day"])
+    try:
+        def _eperm(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+        monkeypatch.setattr(os, "kill", _eperm)
+        assert A._pid_alive(p.pid) is True
+    finally:
+        monkeypatch.undo()
+        p.kill()
+        p.wait()
+
+
+# ── second review round on the public code (f7572e9e7154 .. d0e1c478d925) ────────────────
+def test_initialize_is_refused_every_engine_starts_from_zero():
+    qc = QuantumCircuit(2)
+    qc.initialize([0, 1, 0, 0], [0, 1])
+    with pytest.raises(ValueError, match="initialize"):
+        A.ExactEngine().run(qc, [A.parse_observable("Z0", 2)])
+
+
+def test_barrier_does_not_widen_the_light_cone():
+    qc = QuantumCircuit(6)
+    qc.rx(0.3, 0)
+    qc.barrier()
+    qc.rx(0.2, 0)
+    sub, _ = A._light_cone(qc, "Z", [0])
+    assert sub.num_qubits == 1
+
+
+def test_pps_with_no_observables_returns_an_empty_rung():
+    assert A.PPSEngine().run(QuantumCircuit(2), [], 1e-3).values == []
+
+
+def test_fuse_refuses_non_finite_known_answers_and_infinite_trust():
+    with pytest.raises(ValueError, match="non-finite"):
+        A.fuse(1, [], exact=A.Rung("exact", None, [math.nan], 0.0))
+    with pytest.raises(ValueError, match="non-finite"):
+        A.fuse(1, [], lightcone=A.Rung("lightcone", None, [math.inf], 0.0))
+    with pytest.raises(ValueError, match="trust weights"):
+        A.fuse(1, [_lad("m1", [[0.4], [0.4]], [True])], trust={"m1": math.inf})
+
+
+def test_fuse_checks_every_rung_not_only_the_last():
+    lad = _lad("m1", [[0.4, 0.1], [0.4]], [True])
+    with pytest.raises(ValueError, match="2 values for 1"):
+        A.fuse(1, [lad])
+
+
+def test_run_ladder_treats_a_nan_prediction_as_unaffordable(monkeypatch):
+    monkeypatch.setattr(A, "predict_next", lambda *a, **k: math.nan)
+    eng = _Scripted([[0.5], [0.3], [0.31]], [0.1] * 3)
+    lad = A.run_ladder(eng, None, [None], [1, 2, 3], eps_tol=1e-6)
+    assert len(lad.rungs) == 1 and "predicted" in lad.stop_reason
+
+
+def test_non_finite_rung_amount_is_a_failure_not_a_nan_spend():
+    class _NaNCost(A.Engine):
+        method = "nancost"
+
+        def run(self, target, ops, param):
+            return A.Rung(self.method, param, [0.1 for _ in ops], math.nan, degenerate=[False] * len(ops))
+
+    qc, _ = _ki(n=4, steps=1)
+    rep = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [(_NaNCost(), [1, 2], False)],
+                     budget=5, log_path=None, lightcone=False).run()
+    assert rep["spent"] == 0.0 and "non-finite amount" in rep["failures"][0]["error"]
+
+
+def test_only_witness_sees_a_second_ladder_of_the_same_method():
+    qc, _ = _ki(n=4, steps=1)
+    camp = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, _fake_engines(), budget=50,
+                      log_path=None, lightcone=False)
+    a, b, cloud = A.Ladder("mps"), A.Ladder("mps"), A.Ladder("pps")
+    a.rungs, a.converged = [A.Rung("mps", 1, [0.2], 0.1)], [False]
+    b.rungs, b.converged = [A.Rung("mps", 2, [0.3], 0.1)], [True]
+    cloud.rungs = [A.Rung("pps", p, [0.0], 0.1, degenerate=[True]) for p in (1, 2)]
+    camp.tracks = [A._Track("c", None, [], False, l) for l in (a, b, cloud)]
+    assert camp._only_witness("c", 0, "mps")
+
+
+@pytest.mark.parametrize("patch", [{"devices": ["mps.cpu", "mps.cpu"]}])
+def test_day_spec_refuses_a_repeated_device(tmp_path, patch):
+    import json as _j
+    f, _ = _day_spec(tmp_path)
+    f.write_text(_j.dumps({**_j.loads(f.read_text()), **patch}))
+    with pytest.raises(ValueError, match="repeat"):
+        A.load_day_spec(f)
+
+
+@pytest.mark.parametrize("nq", [8.5, True, 0, "8"])
+def test_day_spec_refuses_a_non_integer_qubit_count(tmp_path, nq):
+    import json as _j
+    f, _ = _day_spec(tmp_path)
+    spec = _j.loads(f.read_text())
+    spec["circuits"]["c1"]["n_qubits"] = nq
+    f.write_text(_j.dumps(spec))
+    with pytest.raises(ValueError, match="n_qubits"):
+        A.load_day_spec(f)
+
+
+def test_atomic_write_leaves_no_temp_file_on_failure(tmp_path, monkeypatch):
+    import os
+    target = tmp_path / "x.json"
+    monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        A._atomic_write(target, "{}")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_rearming_sets_a_finished_runs_heartbeat_aside_but_never_a_live_one(tmp_path):
+    import json as _j
+    f, _ = _day_spec(tmp_path, deadline="2099-01-01T00:00:00+00:00")
+    out, af = tmp_path / "day", tmp_path / "ARMED.json"
+    out.mkdir()
+    (out / "heartbeat.json").write_text(_j.dumps({"pid": 1, "done": True}))
+    A.arm(f, out, armed_file=af)
+    assert not (out / "heartbeat.json").exists()
+    r = A.watch(armed_file=af, now=lambda: 1e9, alive=lambda p: False, spawn=lambda s, o: 4242, send=_Mail())
+    assert r["state"] == "restarted" and af.exists()
+    (out / "heartbeat.json").write_text(_j.dumps({"pid": 4242, "done": False, "steps": 3}))
+    A.arm(f, out, armed_file=af)
+    assert (out / "heartbeat.json").exists()
+
+
+def test_a_restarted_run_that_stays_silent_is_reported_never_respawned(tmp_path):
+    af, _ = _armed(tmp_path, hb={"pid": 1, "ts": 0, "steps": 4, "spent": 1, "budget": 10})
+    spawned, mail, t = [], _Mail(), [1e9]
+    kw = dict(armed_file=af, now=lambda: t[0], spawn=lambda s, o: spawned.append(s) or 4242, send=mail)
+    assert A.watch(alive=lambda p: False, **kw)["state"] == "restarted"
+    assert A.watch(alive=lambda p: p == 4242, **kw)["state"] == "starting"
+    t[0] += A.WATCH_STALE_S + 1
+    assert A.watch(alive=lambda p: p == 4242, **kw)["state"] == "starting_quiet"
+    assert len(spawned) == 1 and "[Augur] restarted run silent" in mail.sent
+
+
+def test_a_failing_spawn_still_reaches_give_up(tmp_path):
+    af, _ = _armed(tmp_path, hb={"pid": 1, "ts": 0, "steps": 4, "spent": 1, "budget": 10})
+
+    def _boom(s, o):
+        raise OSError("no python here")
+
+    states = [A.watch(armed_file=af, now=lambda: 1e9, alive=lambda p: False, spawn=_boom,
+                      send=_Mail())["state"] for _ in range(4)]
+    assert states == ["spawn_failed"] * 3 + ["gave_up"]

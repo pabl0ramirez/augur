@@ -192,10 +192,10 @@ class Engine:
 
 
 def _prepare(circuit):
-    """Drop final measurements; refuse any measurement or reset that remains, because Aer
-    would sample it silently and the other engines would reject it."""
+    """Drop final measurements; refuse any measurement, reset or initialize that remains:
+    Aer would sample a measurement silently, and every engine computes from |0...0>."""
     c = circuit.remove_final_measurements(inplace=False)
-    bad = {ins.operation.name for ins in c.data} & {"measure", "reset"}
+    bad = {ins.operation.name for ins in c.data} & {"measure", "reset", "initialize"}
     if bad:
         raise ValueError(f"mid-circuit {sorted(bad)} not supported: expectation from |0...0> only")
     return c
@@ -293,7 +293,7 @@ class PPSEngine(Engine):
             degen.append(nz == 0 or nz >= cap)
             worst = max(worst, float(trunc))
         return Rung(self.method, float(param), vals, time.perf_counter() - t,
-                    note=(f"terms kept {min(sizes)}-{max(sizes)} of cap {cap}; pauli-prop "
+                    note=(f"terms kept {min(sizes, default=0)}-{max(sizes, default=0)} of cap {cap}; pauli-prop "
                           f"truncation figure {worst:.3g} (not an error bar)"),
                     degenerate=degen)
 
@@ -382,7 +382,8 @@ class BlueQubitEngine(Engine):
         wc = extra.get("pauli_path_weight_cutoff")
         if wc is not None and (isinstance(wc, bool) or not isinstance(wc, int) or wc < 1):
             raise ValueError(f"pauli_path_weight_cutoff must be a positive integer, not {wc!r}")
-        if not (isinstance(bounce_wait_s, (int, float)) and bounce_wait_s > 0 and math.isfinite(bounce_wait_s)) \
+        if isinstance(bounce_wait_s, bool) \
+                or not (isinstance(bounce_wait_s, (int, float)) and bounce_wait_s > 0 and math.isfinite(bounce_wait_s)) \
                 or isinstance(max_bounces, bool) or not isinstance(max_bounces, int) or max_bounces < 0:
             raise ValueError("bounce_wait_s must be positive and finite, max_bounces a non-negative integer")
         if timeout_s is not None and not (isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool)
@@ -394,7 +395,7 @@ class BlueQubitEngine(Engine):
         self.bounce_wait_s, self.max_bounces = bounce_wait_s, max_bounces
         self._sleep = sleep
         self.method = known[device]
-        self.transpilation_level = transpilation_level
+        self.transpilation_level = lvl                 # the validated level, never an unchecked one
         self.timeout_s = timeout_s
 
     def options_for(self, param) -> Dict[str, Any]:
@@ -449,6 +450,8 @@ class BlueQubitEngine(Engine):
             ids = [j.job_id for j in jobs]
             try:
                 left = deadline - time.monotonic()
+                if left <= 0:              # never hand the SDK a zero or negative timeout
+                    raise TimeoutError("deadline passed before the wait began")
                 done = self.client.wait(ids, timeout=left) if math.isfinite(left) else self.client.wait(ids)
                 return _align(done, ids)
             except BaseException as e:
@@ -501,7 +504,12 @@ class BlueQubitEngine(Engine):
         vals: List[Optional[float]] = []
         cost = 0.0
         for r in results:
-            vals.extend(float(v) for v in np.asarray(r.expectation_value, dtype=float).ravel())
+            ev = np.asarray(r.expectation_value)
+            if np.iscomplexobj(ev):
+                if np.abs(ev.imag).max(initial=0.0) > 1e-9:
+                    raise RuntimeError(f"BlueQubit returned a complex expectation value: {ev.ravel()[:4]}")
+                ev = ev.real
+            vals.extend(float(v) for v in np.asarray(ev, dtype=float).ravel())
             cost += float(getattr(r, "cost", 0.0) or 0.0)
         if len(vals) != len(ops):
             raise RuntimeError(f"BlueQubit returned {len(vals)} values for {len(ops)} observables")
@@ -544,12 +552,12 @@ def _light_cone(base, label: str, idx: List[int]):
     from qiskit.transpiler.passes import LightCone
 
     cone = PassManager([LightCone(bit_terms=label[::-1], indices=idx)]).run(base)
-    active = sorted({cone.find_bit(q).index for ins in cone.data for q in ins.qubits} | set(idx))
+    # barriers carry no dynamics; counting their qubits would widen the cone past the cap
+    gates = [ins for ins in cone.data if ins.operation.name != "barrier"]
+    active = sorted({cone.find_bit(q).index for ins in gates for q in ins.qubits} | set(idx))
     remap = {q: i for i, q in enumerate(active)}
     sub = QuantumCircuit(len(active))
-    for ins in cone.data:
-        if ins.operation.name == "barrier":
-            continue
+    for ins in gates:
         sub.append(ins.operation, [remap[cone.find_bit(q).index] for q in ins.qubits])
     sub_op = SparsePauliOp.from_sparse_list([(label, [remap[q] for q in idx], 1.0)], len(active))
     return sub, sub_op
@@ -600,11 +608,19 @@ class Ladder:
 
 
 def _degen(r: Rung, n: int) -> List[bool]:
-    return list(r.degenerate) if len(r.degenerate) == n else [False] * n
+    """Per-observable degenerate flags. An empty list means none flagged; any other length that
+    is not n is a malformed rung and raises, so a flag can never be silently dropped."""
+    if not r.degenerate:
+        return [False] * n
+    if len(r.degenerate) != n:
+        raise ValueError(f"rung {r.method}@{r.param} has {len(r.degenerate)} degenerate flags for {n} values")
+    return [bool(d) for d in r.degenerate]
 
 
 def pps_params(delta0: float = PPS_DELTA0, ratio: float = PPS_RATIO,
                floor: float = BQ_MIN_PPS_THRESHOLD) -> List[float]:
+    if not (0 < ratio < 1) or not (delta0 > 0 and floor > 0):
+        raise ValueError(f"need 0 < ratio < 1 and positive delta0, floor (got {ratio}, {delta0}, {floor})")
     out, d = [], delta0
     while d >= floor:
         out.append(d)
@@ -619,11 +635,14 @@ def predict_next(params: Sequence[Any], amounts: Sequence[float], nxt: Any, inve
     reports this power law for PPS. A slope below 1 (cost not growing with resolution) is
     distrusted: the prediction is then twice the last amount. None under two usable points."""
     pts = [((1 / p if inverse else p), y) for p, y in zip(params, amounts, strict=True)
-           if p is not None and p != 0 and y > min_amount]
-    if nxt is None or (inverse and nxt == 0) or len(pts) < 2 or len({x for x, _ in pts}) < 2:
+           if p is not None and p > 0 and math.isfinite(y) and y > min_amount]
+    if nxt is None or nxt <= 0 or len(pts) < 2 or len({x for x, _ in pts}) < 2:
         return None
     xs, ys = zip(*pts, strict=True)
-    b, a = np.polyfit(np.log(xs), np.log(ys), 1)
+    try:
+        b, a = np.polyfit(np.log(xs), np.log(ys), 1)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
     if b < 1.0:
         return 2.0 * float(ys[-1])
     x = 1 / nxt if inverse else nxt
@@ -660,7 +679,8 @@ def run_ladder(engine: Engine, target, ops, params: Sequence[Any], *, eps_tol: f
     for p in params:
         if lad.rungs:
             pred = predict_next([r.param for r in lad.rungs], [r.elapsed_s for r in lad.rungs], p, inverse)
-            if pred is not None and spent + pred > budget_s:
+            # NaN compares false with everything: a non-finite prediction is unaffordable
+            if pred is not None and (not math.isfinite(pred) or spent + pred > budget_s):
                 lad.stop_reason = f"next rung {p} predicted {pred:.1f}s, {budget_s - spent:.1f}s left"
                 break
         try:
@@ -716,8 +736,28 @@ def fuse(n_ops: int, ladders: Sequence[Ladder], lightcone: Optional[Rung] = None
 
     `trust` (from `calibrate`, measured on circuits with known answers) divides each method's
     sigma before comparison, so on a family where one method has proven more accurate its
-    values win a disagreement. Default: every method trusted equally."""
+    values win a disagreement. The reported sigma of a single-method or unconverged estimate
+    is that trust-divided sigma too, so a less trusted method also carries a wider error bar.
+    Default: every method trusted equally.
+
+    Every exact, light-cone and ladder rung must hold n_ops values; a mismatch raises."""
     trust = trust or {}
+    bad_trust = {m: w for m, w in trust.items() if not (math.isfinite(float(w)) and float(w) >= 0)}
+    if bad_trust:
+        raise ValueError(f"fuse: trust weights must be finite and non-negative: {bad_trust}")
+    for name, rung in (("exact", exact), ("lightcone", lightcone)):
+        if rung is None:
+            continue
+        if len(rung.values) != n_ops:
+            raise ValueError(f"fuse: {name} has {len(rung.values)} values for {n_ops} observables")
+        # None means "not covered" (a cone too wide); a NaN or inf would pass as a known answer
+        if any(v is not None and not math.isfinite(v) for v in rung.values):
+            raise ValueError(f"fuse: {name} holds a non-finite value: {rung.values}")
+    for lad in ladders:
+        for r in lad.rungs:
+            if len(r.values) != n_ops:
+                raise ValueError(f"fuse: {lad.method} rung {r.param} has {len(r.values)} values "
+                                 f"for {n_ops} observables")
     out: List[Estimate] = []
     for i in range(n_ops):
         ex_v = exact.values[i] if exact is not None else None
@@ -784,7 +824,7 @@ def fuse(n_ops: int, ladders: Sequence[Ladder], lightcone: Optional[Rung] = None
 def score(estimates: Any, exact: Any) -> Dict[str, float]:
     """Pearson correlation and signal-to-noise var(exact) / mean squared error. The organizers
     say the score is how well the estimates "correlate (signal-to-noise)"
-    (HACKATHON_POST_EXCERPT.txt) without giving the formula, so both are reported."""
+    (the hackathon announcement) without giving the formula, so both are reported."""
     e, x = np.asarray(estimates, float), np.asarray(exact, float)
     if e.shape != x.shape:
         raise ValueError(f"score: {e.shape} estimates against {x.shape} exact values")
@@ -803,7 +843,8 @@ def calibrate(samples: Sequence[Tuple[Any, Sequence, Sequence[float]]],
     """Measure each method on circuits whose answers are known (the day's open sample
     circuits, with exact or light-cone-exact values) and return trust weights for `fuse`.
     Each method runs its own ladder on each sample under `budget_s`; its trust is
-    1 / (rmse + 1e-3), normalised so the best method has trust 1."""
+    1 / (rmse + 1e-3), normalised so the best method has trust 1. A sample on which a method
+    returned a non-finite value counts as infinite error, so that method's trust is 0."""
     engines = engines or local_engines()
     per: Dict[str, List[float]] = {}
     detail = []
@@ -814,12 +855,14 @@ def calibrate(samples: Sequence[Tuple[Any, Sequence, Sequence[float]]],
             if not lad.rungs:
                 continue
             s = score(lad.values(), exact)
-            per.setdefault(eng.method, []).append(s["rmse"])
+            per.setdefault(eng.method, []).append(s["rmse"] if math.isfinite(s["rmse"]) else math.inf)
             detail.append({"method": eng.method, **s, "last_param": lad.rungs[-1].param})
     if not per:
         raise ValueError("calibration produced no results")
     raw = {m: 1.0 / (float(np.mean(v)) + 1e-3) for m, v in per.items()}
     best = max(raw.values())
+    if not best > 0:
+        raise ValueError("calibration: no method returned finite values on every sample")
     return {"trust": {m: r / best for m, r in raw.items()}, "detail": detail}
 
 
@@ -885,8 +928,17 @@ class Campaign:
                  lightcone: bool = True, retries: int = 2, backoff_s: float = 5.0,
                  trust: Optional[Dict[str, float]] = None,
                  on_step: Optional[Callable[["Campaign"], None]] = None):
-        if budget < 0 or first_rung_guess < 0:
-            raise ValueError("budget and first_rung_guess must be non-negative")
+        # NaN compares false with everything, so a NaN budget would never bind: refuse it
+        if not (math.isfinite(budget) and budget >= 0 and math.isfinite(first_rung_guess)
+                and first_rung_guess >= 0):
+            raise ValueError("budget and first_rung_guess must be finite and non-negative")
+        if not engines:
+            raise ValueError("a campaign needs at least one engine")
+        bad_trust = {m: w for m, w in (trust or {}).items()
+                     if isinstance(w, bool) or not isinstance(w, (int, float))
+                     or not (math.isfinite(w) and w >= 0)}
+        if bad_trust:
+            raise ValueError(f"trust weights must be finite and non-negative: {bad_trust}")
         if agree < 1 or eps_tol < 0 or retries < 0 or backoff_s < 0:
             raise ValueError("need agree >= 1 and non-negative eps_tol, retries, backoff_s")
         if cost_metric not in ("seconds", "usd"):
@@ -953,7 +1005,8 @@ class Campaign:
         lads = [tr.ladder for tr in self.tracks if tr.circuit == cid and tr.ladder.rungs]
         mine = [l for l in lads if l.method == basis]
         others = [l for l in lads if l.method != basis]
-        if not mine or not others or not (len(mine[0].converged) > i and mine[0].converged[i]):
+        # the same method may run as more than one ladder: any of them converged is enough
+        if not mine or not others or not any(len(l.converged) > i and l.converged[i] for l in mine):
             return False
         n = len(self.targets[cid][1])
         return all(all(_degen(r, n)[i] for r in l.rungs[-2:]) and len(l.rungs) >= 2 for l in others)
@@ -1020,10 +1073,20 @@ class Campaign:
             self.failures.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
             self.history.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
             return
-        if len(r.values) != len(need):
-            msg = f"engine returned {len(r.values)} values for {len(need)} observables at {p}"
+        if not math.isfinite(self._amount(r)):
+            # a NaN or inf amount would make `spent` NaN, and a NaN budget check never binds
+            msg = f"engine reported a non-finite amount {self._amount(r)!r} at {p}"
             tr.ladder.done, tr.ladder.stop_reason = True, msg
             self.failures.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
+            return
+        if len(r.values) != len(need):
+            # the rung ran and was paid for: charge it even though its values are unusable
+            msg = f"engine returned {len(r.values)} values for {len(need)} observables at {p}"
+            tr.ladder.done, tr.ladder.stop_reason = True, msg
+            self.spent += self._amount(r)
+            self.failures.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
+            self.history.append({"circuit": cid, "method": r.method, "param": p,
+                                 "amount": self._amount(r), "error": msg})
             return
         full = _expand_rung(r, need, len(ops))
         if tr.ladder.rungs:
@@ -1118,29 +1181,35 @@ class Campaign:
         """Rebuild every ladder from a run log written by an earlier process, so a restart
         never buys a rung it already paid for. Returns the number of rungs restored; spending
         is restored too. Rows for other circuits, unknown methods, or rungs already restored
-        are skipped."""
+        are skipped. A malformed row (bad JSON, wrong types, wrong lengths, non-finite amounts)
+        is skipped too, never fatal, and the count of such rows is reported as one failure."""
         if not path.exists():
             return 0
-        restored = 0
+        restored = malformed = 0
         with path.open(encoding="utf-8") as fh:
             for line in fh:
                 try:
                     rec = json.loads(line)
-                except ValueError:
+                    cid, meth = rec.get("circuit"), rec.get("method")
+                    tr = next((x for x in self.tracks
+                               if x.circuit == cid and x.engine.method == meth), None)
+                    if tr is None or "values" not in rec or rec.get("param") not in tr.params:
+                        continue
+                    k = tr.params.index(rec["param"])
+                    n = len(self.targets[cid][1])
+                    if k < tr.pos:
+                        continue
+                    if not isinstance(rec["values"], list) or len(rec["values"]) != n:
+                        raise ValueError("values")
+                    vals: List[Optional[float]] = [math.nan if v is None else float(v) for v in rec["values"]]
+                    deg = [bool(d) for d in (rec.get("degenerate") or [False] * n)]
+                    elapsed, cost = float(rec.get("elapsed_s", 0.0)), float(rec.get("cost_usd", 0.0))
+                    if len(deg) != n or not (math.isfinite(elapsed) and math.isfinite(cost)):
+                        raise ValueError("degenerate or amounts")
+                except (ValueError, TypeError, AttributeError):
+                    malformed += 1
                     continue
-                cid, meth = rec.get("circuit"), rec.get("method")
-                tr = next((x for x in self.tracks
-                           if x.circuit == cid and x.engine.method == meth), None)
-                if tr is None or "values" not in rec or rec.get("param") not in tr.params:
-                    continue
-                k = tr.params.index(rec["param"])
-                n = len(self.targets[cid][1])
-                if k < tr.pos or len(rec["values"]) != n:
-                    continue
-                vals: List[Optional[float]] = [math.nan if v is None else float(v) for v in rec["values"]]
-                deg = list(rec.get("degenerate") or [False] * n)
-                r = Rung(meth, rec["param"], vals, float(rec.get("elapsed_s", 0.0)),
-                         float(rec.get("cost_usd", 0.0)), rec.get("note", ""), deg)
+                r = Rung(meth, rec["param"], vals, elapsed, cost, str(rec.get("note", "")), deg)
                 tr.ladder.rungs.append(r)
                 tr.pos = k + 1
                 self.spent += self._amount(r)
@@ -1154,6 +1223,9 @@ class Campaign:
             if all(tr.ladder.converged[i] for i in need) or tr.pos >= len(tr.params):
                 tr.ladder.done = True
                 tr.ladder.stop_reason = "restored: converged or exhausted"
+        if malformed:
+            self.failures.append({"circuit": "-", "method": "load_log", "param": None,
+                                  "error": f"{malformed} malformed run-log row(s) skipped in {path}"})
         return restored
 
     def estimates(self, cid: str, strict: bool = True) -> List[Optional[Estimate]]:
@@ -1256,7 +1328,8 @@ def _logger(path: Optional[Path], key: str) -> Callable[[Dict[str, Any]], None]:
 # ── practice circuits (families the paper and the organizers point at) ────────
 def heavy_hex_edges(rows: int, cols: int) -> List[Tuple[int, int]]:
     """A brick-wall lattice, degree <= 3 like heavy-hex: every qubit on a rows x cols grid,
-    all horizontal bonds, vertical bonds on alternating columns."""
+    all horizontal bonds, and a vertical bond below (r, c) only where r + c is even, so the
+    vertical bonds alternate columns and shift by one column on each row."""
     e = []
     for r in range(rows):
         for c in range(cols - 1):
@@ -1313,6 +1386,9 @@ def bench(families: Sequence[str] = ("kicked_ising", "brickwork"), n_rows: int =
     """Score the campaign and each method alone against exact on practice circuits. The
     default leaves the light cone off, because the graded circuits are hidden and the day's
     campaign cannot cut a cone it cannot see."""
+    unknown = sorted(set(families) - {"kicked_ising", "brickwork"})
+    if unknown:
+        raise ValueError(f"unknown bench families {unknown}; known: kicked_ising, brickwork")
     n = n_rows * n_cols
     edges = heavy_hex_edges(n_rows, n_cols)
     rows = []
@@ -1372,19 +1448,33 @@ def load_day_spec(path: Path) -> Dict[str, Any]:
     A target ending in .qasm is loaded as a circuit (the sample circuits); anything else is
     passed to BQClient.run as given (the graded ids; see LIMITS)."""
     spec: Dict[str, Any] = json.loads(Path(path).read_text())
+    if not isinstance(spec, dict):
+        raise ValueError("day spec must be a JSON object")
     for key in ("budget_usd", "circuits"):
         if key not in spec:
             raise ValueError(f"day spec missing {key!r}")
-    if float(spec["budget_usd"]) < 0:
-        raise ValueError("budget_usd must be non-negative")
-    if not spec["circuits"]:
+    # json.loads accepts NaN and Infinity, and a NaN budget would never bind
+    for key in ("budget_usd", "first_rung_guess_usd"):
+        v = spec.get(key, 0)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (math.isfinite(v) and v >= 0):
+            raise ValueError(f"{key} must be a finite non-negative number, not {v!r}")
+    if "devices" in spec and not (isinstance(spec["devices"], list) and spec["devices"]):
+        raise ValueError("devices, when given, must be a non-empty list")
+    if "devices" in spec and len(set(map(str, spec["devices"]))) != len(spec["devices"]):
+        raise ValueError(f"devices repeat {spec['devices']}: the same backend would be bought twice")
+    if not isinstance(spec["circuits"], dict) or not spec["circuits"]:
         raise ValueError("day spec has no circuits")
     for cid, c in spec["circuits"].items():
+        if not isinstance(c, dict):
+            raise ValueError(f"circuit {cid!r} must be a JSON object")
         for key in ("target", "observables"):
             if key not in c:
                 raise ValueError(f"circuit {cid!r} missing {key!r}")
         if "n_qubits" not in c and str(c["target"]).endswith(".qasm"):
             raise ValueError(f"circuit {cid!r} missing 'n_qubits' (only an id target can look it up)")
+        nq = c.get("n_qubits")
+        if nq is not None and (isinstance(nq, bool) or not isinstance(nq, int) or nq < 1):
+            raise ValueError(f"circuit {cid!r}: n_qubits must be a positive integer, not {nq!r}")
         if not c["observables"]:
             raise ValueError(f"circuit {cid!r} has no observables")
     if spec.get("deadline_utc"):
@@ -1522,12 +1612,21 @@ def run_day(spec: Dict[str, Any], client, out_dir: Path = DATA_DIR / "day",
 def _atomic_write(path: Path, text: str) -> None:
     import os
 
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    tmp.replace(path)
+    import tempfile
+
+    # a fresh, exclusively created temp file (never a predictable name that a symlink could
+    # redirect), removed if anything fails before the rename
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _write_submission(spec: Dict[str, Any], rep: Dict[str, Any], path: Path) -> List[str]:
@@ -1541,7 +1640,10 @@ def _write_submission(spec: Dict[str, Any], rep: Dict[str, Any], path: Path) -> 
     w = csv.writer(buf)
     w.writerow(["circuit", "index", "observable", "value", "sigma", "basis"])
     for cid, c in spec["circuits"].items():
-        for i, e in enumerate(rep["circuits"][cid]["estimates"]):
+        rows = rep["circuits"][cid]["estimates"]
+        if len(rows) != len(c["observables"]):    # the report pads to one row per observable
+            raise ValueError(f"{cid}: {len(rows)} estimates for {len(c['observables'])} observables")
+        for i, e in enumerate(rows):
             v = e["value"]
             if not math.isfinite(v):
                 missing.append(f"{cid}#{i}")
@@ -1588,6 +1690,20 @@ def arm(spec_path: Path, out_dir: Path = DATA_DIR / "day", armed_file: Optional[
            "armed_at": time.time(), "armed_by": "CLI (augur arm --confirm-spend)"}
     path = armed_file or ARMED_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
+    # a FINISHED earlier run's heartbeat would make the first watch pass report "done" and
+    # disarm this new consent at once: set it and its watch state aside. A live run's
+    # heartbeat stays, since hiding its pid would start a second paid run beside it.
+    hb_path = Path(out_dir) / "heartbeat.json"
+    try:
+        stale = hb_path.exists() and bool(json.loads(hb_path.read_text()).get("done"))
+    except (ValueError, AttributeError):
+        stale = False
+    if stale:
+        stamp = int(time.time())
+        for name in ("heartbeat.json", "watch_state.json"):
+            old = Path(out_dir) / name
+            if old.exists():
+                old.replace(old.with_name(f"{name}.prev-{stamp}"))
     _atomic_write(path, json.dumps(rec, indent=1))
     return rec
 
@@ -1608,15 +1724,26 @@ def disarm(armed_file: Optional[Path] = None, reason: str = "user") -> bool:
 
 def _pid_alive(pid: Optional[int]) -> bool:
     """True only if the process exists AND is an Augur run: a recycled PID belonging to some
-    other program must not make a dead run look alive (it would never be restarted)."""
+    other program must not make a dead run look alive (it would never be restarted).
+
+    Errs toward alive: a live run wrongly called dead would be restarted beside itself and
+    spend twice, while a dead run wrongly called alive only delays a restart. So a process
+    owned by another user (EPERM) is still identified, and without /proc (macOS) an existing
+    PID counts as alive. On Windows os.kill(pid, 0) would signal the process, so it refuses."""
     import os
 
+    if os.name != "posix":
+        raise RuntimeError("the watchdog's process check needs a POSIX system")
     if not pid:
         return False
     try:
         os.kill(int(pid), 0)
+    except PermissionError:
+        pass                                    # it exists; someone else owns it
     except (OSError, ValueError):
         return False
+    if not Path("/proc/self").exists():
+        return True
     try:
         cmd = Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ")
     except OSError:
@@ -1650,6 +1777,7 @@ def _email(subject: str, body: str) -> Tuple[bool, str]:
     and the watchdog records why, so a missing channel is visible, never silent."""
     import os
     import smtplib
+    import ssl
     from email.message import EmailMessage
 
     host, user = os.getenv("AUGUR_SMTP_HOST"), os.getenv("AUGUR_SMTP_USER")
@@ -1659,14 +1787,16 @@ def _email(subject: str, body: str) -> Tuple[bool, str]:
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, user, to
     msg.set_content(body)
+    # verify the server certificate and host name: smtplib does neither by default
+    ctx = ssl.create_default_context()
     try:
         if os.getenv("AUGUR_SMTP_STARTTLS") == "1":
             with smtplib.SMTP(host, int(os.getenv("AUGUR_SMTP_PORT", "587")), timeout=30) as s:
-                s.starttls()
+                s.starttls(context=ctx)
                 s.login(user, pwd)
                 s.send_message(msg)
         else:
-            with smtplib.SMTP_SSL(host, int(os.getenv("AUGUR_SMTP_PORT", "465")), timeout=30) as s:
+            with smtplib.SMTP_SSL(host, int(os.getenv("AUGUR_SMTP_PORT", "465")), timeout=30, context=ctx) as s:
                 s.login(user, pwd)
                 s.send_message(msg)
         return True, "sent"
@@ -1690,11 +1820,23 @@ def watch(*, armed_file: Optional[Path] = None, now: Optional[Callable[[], float
     path = armed_file or ARMED_FILE
     if not path.exists():
         return {"state": "idle"}
-    armed = json.loads(path.read_text())
-    out = Path(armed["out_dir"])
+    try:
+        armed = json.loads(path.read_text())
+        out = Path(armed["out_dir"])
+        deadline = datetime.fromisoformat(armed["deadline_utc"]).timestamp()
+    except (ValueError, TypeError, KeyError, OSError) as e:
+        # never guess at consent: an unreadable consent file spawns nothing and says why
+        return {"state": "armed_unreadable", "error": f"{type(e).__name__}: {e}"}
     state_path = out / "watch_state.json"
-    st: Dict[str, Any] = json.loads(state_path.read_text()) if state_path.exists() else {
-        "restarts_without_progress": 0, "steps_at_restart": -1, "alerted": {}, "failures_seen": 0}
+    fresh = {"restarts_without_progress": 0, "steps_at_restart": -1, "alerted": {}, "failures_seen": 0}
+    st: Dict[str, Any] = dict(fresh)
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text())
+            if isinstance(loaded, dict):
+                st.update(loaded)
+        except ValueError:
+            st["state_reset"] = "watch_state.json was unreadable and was reset"
     hb: Dict[str, Any] = {}
     if (out / "heartbeat.json").exists():
         try:
@@ -1702,19 +1844,23 @@ def watch(*, armed_file: Optional[Path] = None, now: Optional[Callable[[], float
         except ValueError:
             hb = {}
     t_now = clock()
-    deadline = datetime.fromisoformat(armed["deadline_utc"]).timestamp()
     latest = out / "submission_latest.csv"
+    this_pass: List[Dict[str, Any]] = []
 
     def alert(kind: str, subject: str, body: str, final: bool = False) -> None:
         last = float(st["alerted"].get(kind, 0))
         if final or t_now - last >= WATCH_ALERT_GAP_S:
             ok, why = send(f"[Augur] {subject}", body)
-            st["alerted"][kind] = t_now
-            st.setdefault("sent", []).append({"kind": kind, "ok": ok, "why": why, "ts": t_now})
+            st["alerted"][kind] = t_now        # rate-limited even when the send failed: no flood
+            rec = {"kind": kind, "ok": ok, "why": why, "ts": t_now}
+            st.setdefault("sent", []).append(rec)
+            this_pass.append(rec)
 
     def finish(state: str) -> Dict[str, Any]:
+        # every alert this pass, delivered or not, is in the result, so a dead channel shows
         _atomic_write(state_path, json.dumps(st))
-        return {"state": state, "heartbeat": hb, "restarts_without_progress": st["restarts_without_progress"]}
+        return {"state": state, "heartbeat": hb, "restarts_without_progress": st["restarts_without_progress"],
+                "alerts": this_pass}
 
     out.mkdir(parents=True, exist_ok=True)
     if hb.get("done"):
@@ -1739,7 +1885,13 @@ def watch(*, armed_file: Optional[Path] = None, now: Optional[Callable[[], float
     spawned = st.get("last_spawn_pid")
     if spawned and spawned != hb.get("pid") and alive(spawned):
         # restarted, and the new run has not written its first heartbeat yet: it is starting,
-        # and a second spawn now would run two paid campaigns side by side
+        # and a second spawn now would run two paid campaigns side by side. It is never
+        # restarted, but a start that stays silent past WATCH_STALE_S is reported.
+        if t_now - float(st.get("last_spawn_ts", t_now)) >= WATCH_STALE_S:
+            alert("start_quiet", "restarted run silent",
+                  f"pid {spawned} is alive but has written no heartbeat since its restart; "
+                  f"look at {out / 'day_process.log'}. Not restarted.")
+            return finish("starting_quiet")
         return finish("starting")
     if alive(hb.get("pid")):
         # A live process is never restarted: one cloud rung can legitimately outlast any
@@ -1761,10 +1913,15 @@ def watch(*, armed_file: Optional[Path] = None, now: Optional[Callable[[], float
               f"latest submission {latest}. Look at {out / 'day_process.log'}.", final=True)
         disarm(path, "no progress after restarts")
         return finish("gave_up")
-    pid = spawn(armed["spec"], armed["out_dir"])
-    st["restarts_without_progress"] += 1
-    st["steps_at_restart"] = steps
+    st["restarts_without_progress"] += 1          # counted before the spawn, so a spawn that
+    st["steps_at_restart"] = steps                # keeps failing still reaches the give-up
+    try:
+        pid = spawn(armed["spec"], armed["out_dir"])
+    except Exception as e:
+        alert("spawn_failed", "restart failed", f"Could not restart the day run: {type(e).__name__}: {e}")
+        return finish("spawn_failed")
     st["last_spawn_pid"] = pid
+    st["last_spawn_ts"] = t_now
     alert("restart", "run restarted",
           f"The day run was not running; restarted with --resume (pid {pid}). "
           f"Restart {st['restarts_without_progress']} without progress.")
@@ -1775,7 +1932,7 @@ def watch_pulse() -> Dict[str, Any]:
     """One watchdog pass as a health record. Idle (no spend, no network) unless armed."""
     try:
         r = watch()
-        return {"agent": "AugurWatch", "success": r["state"] not in ("gave_up",),
+        return {"agent": "AugurWatch", "success": r["state"] not in ("gave_up", "armed_unreadable"),
                 "message": f"AugurWatch: {r['state']}"}
     except Exception as e:  # pragma: no cover
         return {"agent": "AugurWatch", "success": False, "message": f"{type(e).__name__}: {e}"}
@@ -1876,9 +2033,14 @@ def _dispatch(ap: argparse.ArgumentParser, a: argparse.Namespace) -> int:
     if a.cmd == "watch":
         _load_env()
         while True:
-            r = watch()
-            print(json.dumps({k: r[k] for k in r if k != "heartbeat"}), flush=True)
-            if not a.loop or r["state"] in ("idle", "done", "deadline", "gave_up"):
+            try:
+                r = watch()
+            except Exception as e:      # a looping watchdog reports a bad pass and keeps watching
+                r = {"state": "error", "error": f"{type(e).__name__}: {e}"}
+            print(json.dumps({k: r[k] for k in r if k != "heartbeat"}, default=str), flush=True)
+            if not a.loop:
+                return 1 if r["state"] in ("error", "armed_unreadable") else 0
+            if r["state"] in ("idle", "done", "deadline", "gave_up"):
                 return 0
             time.sleep(a.every_s)
     if a.cmd == "day":

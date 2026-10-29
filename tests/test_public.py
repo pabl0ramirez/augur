@@ -55,8 +55,9 @@ def test_alert_uses_starttls_when_asked(monkeypatch):
     calls = []
 
     class _SMTP:
-        def __init__(self, host, port, timeout):
-            calls.append(("plain", host, port))
+        def __init__(self, host, port, timeout, context=None):
+            calls.append(("ssl" if context is not None else "plain", host, port))
+            self.ctx = context
 
         def __enter__(self):
             return self
@@ -64,8 +65,9 @@ def test_alert_uses_starttls_when_asked(monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def starttls(self):
-            calls.append(("starttls",))
+        def starttls(self, context=None):
+            calls.append(("starttls", context is not None and context.check_hostname
+                          and context.verify_mode == ssl.CERT_REQUIRED))
 
         def login(self, u, p):
             calls.append(("login", u))
@@ -74,10 +76,17 @@ def test_alert_uses_starttls_when_asked(monkeypatch):
             calls.append(("sent", m["To"]))
 
     import smtplib
+    import ssl
     monkeypatch.setattr(smtplib, "SMTP", _SMTP)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _SMTP)
     for k, v in {"AUGUR_SMTP_HOST": "smtp.example.org", "AUGUR_SMTP_USER": "me@example.org",
                  "AUGUR_SMTP_PASSWORD": "x", "AUGUR_ALERT_TO": "you@example.org",
                  "AUGUR_SMTP_STARTTLS": "1"}.items():
         monkeypatch.setenv(k, v)
     ok, why = A._email("s", "b")
-    assert ok and calls[0] == ("plain", "smtp.example.org", 587) and ("starttls",) in calls
+    # STARTTLS with a context that checks the certificate and the host name
+    assert ok and calls[0] == ("plain", "smtp.example.org", 587) and ("starttls", True) in calls
+    calls.clear()
+    monkeypatch.setenv("AUGUR_SMTP_STARTTLS", "0")
+    ok, why = A._email("s", "b")
+    assert ok and calls[0] == ("ssl", "smtp.example.org", 465)

@@ -52,7 +52,7 @@ computer. It reads what the simulators return and infers what the ideal machine 
 ## Install and try
 
     pip install -e ".[test]"          # add ".[cloud]" for BlueQubit
-    python -m pytest -q tests/        # 133 tests
+    python -m pytest -q tests/        # 177 tests
     augur pulse                       # self-check against exact values
     augur estimate --qasm circuit.qasm --obs Z0,Z1Z2,X5
     augur bench                       # score each method on practice circuits
@@ -77,6 +77,9 @@ an answer. Scores, receipts and the full write-up are in
 - A converged ladder is evidence, not proof. `sigma` is the spread between the last rungs, an
   empirical error bar, never a bound.
 - Deep, strongly scrambling circuits can defeat both MPS and Pauli path at affordable settings.
+- The watchdog identifies a run through `/proc`, so it is exact on Linux. On macOS any process
+  with the run's PID counts as alive, which can delay a restart but never starts a second paid
+  run. It refuses to run on Windows.
 - Whether Augur's budget planning costs less than running everything at the top setting has not
   been measured yet. We make no savings claim until a pre-registered test supports one.
 
