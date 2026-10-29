@@ -1543,10 +1543,34 @@ def test_malformed_degenerate_flags_raise_and_empty_means_none():
         A._degen(A.Rung("m", 1, [0.1, 0.2], 0.0, degenerate=[True]), 2)
 
 
+def _bounded_call(expr: str):
+    """Run `expr` in a child Python capped at 1 GB and 30 s. Code that loops forever (as
+    pps_params did before its guard) then dies in the child instead of exhausting the machine:
+    on 2026-10-28 the pre-patch run of these tests reached 22 GB and the OOM killer took the
+    editor with it. Returns the CompletedProcess, or None when the child timed out."""
+    import resource
+    import subprocess
+    import sys as _s
+
+    def _cap():
+        resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+
+    code = f"from augur import core as A\nimport math\n{expr}"
+    try:
+        return subprocess.run([_s.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
+                              capture_output=True, text=True, timeout=30, preexec_fn=_cap)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _refuses_with_value_error(expr: str) -> bool:
+    r = _bounded_call(expr)
+    return r is not None and r.returncode != 0 and "ValueError" in r.stderr
+
+
 @pytest.mark.parametrize("ratio", [1.0, 1.5, 0.0, -0.5])
 def test_pps_params_refuse_a_ratio_that_never_ends(ratio):
-    with pytest.raises(ValueError, match="ratio"):
-        A.pps_params(ratio=ratio)
+    assert _refuses_with_value_error(f"A.pps_params(ratio={ratio})")
 
 
 def test_fuse_refuses_length_mismatch():
@@ -1813,8 +1837,7 @@ def test_a_failing_spawn_still_reaches_give_up(tmp_path):
 
 # ── review of the full diff (a65cc3288fd4) ───────────────────────────────────────────
 def test_pps_params_refuse_an_infinite_start_that_never_ends():
-    with pytest.raises(ValueError):
-        A.pps_params(delta0=math.inf)
+    assert _refuses_with_value_error("A.pps_params(delta0=math.inf)")
 
 
 def test_predict_next_ignores_infinite_params():
