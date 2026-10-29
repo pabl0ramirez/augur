@@ -52,7 +52,7 @@ computer. It reads what the simulators return and infers what the ideal machine 
 ## Install and try
 
     pip install -e ".[test]"          # add ".[cloud]" for BlueQubit
-    python -m pytest -q tests/        # 177 tests
+    python -m pytest -q tests/        # 187 tests
     augur pulse                       # self-check against exact values
     augur estimate --qasm circuit.qasm --obs Z0,Z1Z2,X5
     augur bench                       # score each method on practice circuits

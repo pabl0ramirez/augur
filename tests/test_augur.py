@@ -1730,7 +1730,7 @@ def test_non_finite_rung_amount_is_a_failure_not_a_nan_spend():
     qc, _ = _ki(n=4, steps=1)
     rep = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [(_NaNCost(), [1, 2], False)],
                      budget=5, log_path=None, lightcone=False).run()
-    assert rep["spent"] == 0.0 and "non-finite amount" in rep["failures"][0]["error"]
+    assert rep["spent"] == 0.0 and "invalid amount" in rep["failures"][0]["error"]
 
 
 def test_only_witness_sees_a_second_ladder_of_the_same_method():
@@ -1809,3 +1809,67 @@ def test_a_failing_spawn_still_reaches_give_up(tmp_path):
     states = [A.watch(armed_file=af, now=lambda: 1e9, alive=lambda p: False, spawn=_boom,
                       send=_Mail())["state"] for _ in range(4)]
     assert states == ["spawn_failed"] * 3 + ["gave_up"]
+
+
+# ── review of the full diff (a65cc3288fd4) ───────────────────────────────────────────
+def test_pps_params_refuse_an_infinite_start_that_never_ends():
+    with pytest.raises(ValueError):
+        A.pps_params(delta0=math.inf)
+
+
+def test_predict_next_ignores_infinite_params():
+    assert A.predict_next([math.inf, 2.0], [1.0, 2.0], 4.0, inverse=False) is None
+    assert A.predict_next([1.0, 2.0], [1.0, 4.0], math.inf, inverse=False) is None
+
+
+@pytest.mark.parametrize("kw", [{"eps_tol": math.nan}, {"backoff_s": math.nan}, {"agree": 2.5},
+                                {"retries": 1.5}])
+def test_campaign_refuses_nan_and_fractional_settings(kw):
+    qc, _ = _ki(n=4, steps=1)
+    with pytest.raises(ValueError):
+        A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, _fake_engines(), budget=5,
+                   log_path=None, lightcone=False, **kw)
+
+
+def test_negative_rung_amount_never_hands_budget_back():
+    class _Refund(A.Engine):
+        method = "refund"
+
+        def run(self, target, ops, param):
+            return A.Rung(self.method, param, [0.1 for _ in ops], -3.0, degenerate=[False] * len(ops))
+
+    qc, _ = _ki(n=4, steps=1)
+    rep = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [(_Refund(), [1, 2], False)],
+                     budget=5, log_path=None, lightcone=False).run()
+    assert rep["spent"] == 0.0 and "invalid amount" in rep["failures"][0]["error"]
+
+
+def test_day_spec_observables_must_be_a_list(tmp_path):
+    import json as _j
+    f, _ = _day_spec(tmp_path)
+    spec = _j.loads(f.read_text())
+    spec["circuits"]["c1"]["observables"] = "Z0"
+    f.write_text(_j.dumps(spec))
+    with pytest.raises(ValueError, match="non-empty list"):
+        A.load_day_spec(f)
+
+
+def test_watch_resets_a_state_file_with_wrong_types(tmp_path):
+    import json as _j
+    af, out = _armed(tmp_path, hb={"pid": 1, "ts": 0, "steps": 4, "spent": 9, "budget": 10})
+    (out / "watch_state.json").write_text(_j.dumps({"alerted": {"credits80": "soon"}, "sent": "x"}))
+    r = A.watch(armed_file=af, now=lambda: 1e9, alive=lambda p: True, spawn=lambda s, o: 1, send=_Mail())
+    assert r["state"] == "quiet"
+
+
+def test_pid_alive_errs_alive_when_proc_hides_the_process(monkeypatch):
+    import os
+    real_read = Path.read_bytes
+
+    def _hidden(self):
+        if str(self).endswith("/cmdline"):
+            raise PermissionError(13, "hidepid")
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _hidden)
+    assert A._pid_alive(os.getpid()) is True

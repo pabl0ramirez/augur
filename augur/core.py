@@ -619,7 +619,7 @@ def _degen(r: Rung, n: int) -> List[bool]:
 
 def pps_params(delta0: float = PPS_DELTA0, ratio: float = PPS_RATIO,
                floor: float = BQ_MIN_PPS_THRESHOLD) -> List[float]:
-    if not (0 < ratio < 1) or not (delta0 > 0 and floor > 0):
+    if not (0 < ratio < 1) or not (0 < delta0 < math.inf and 0 < floor < math.inf):
         raise ValueError(f"need 0 < ratio < 1 and positive delta0, floor (got {ratio}, {delta0}, {floor})")
     out, d = [], delta0
     while d >= floor:
@@ -635,8 +635,8 @@ def predict_next(params: Sequence[Any], amounts: Sequence[float], nxt: Any, inve
     reports this power law for PPS. A slope below 1 (cost not growing with resolution) is
     distrusted: the prediction is then twice the last amount. None under two usable points."""
     pts = [((1 / p if inverse else p), y) for p, y in zip(params, amounts, strict=True)
-           if p is not None and p > 0 and math.isfinite(y) and y > min_amount]
-    if nxt is None or nxt <= 0 or len(pts) < 2 or len({x for x, _ in pts}) < 2:
+           if p is not None and 0 < p < math.inf and math.isfinite(y) and y > min_amount]
+    if nxt is None or not (0 < nxt < math.inf) or len(pts) < 2 or len({x for x, _ in pts}) < 2:
         return None
     xs, ys = zip(*pts, strict=True)
     try:
@@ -939,8 +939,10 @@ class Campaign:
                      or not (math.isfinite(w) and w >= 0)}
         if bad_trust:
             raise ValueError(f"trust weights must be finite and non-negative: {bad_trust}")
-        if agree < 1 or eps_tol < 0 or retries < 0 or backoff_s < 0:
-            raise ValueError("need agree >= 1 and non-negative eps_tol, retries, backoff_s")
+        if (isinstance(agree, bool) or not isinstance(agree, int) or agree < 1
+                or isinstance(retries, bool) or not isinstance(retries, int) or retries < 0
+                or not (0 <= eps_tol < math.inf) or not (0 <= backoff_s < math.inf)):
+            raise ValueError("need integer agree >= 1 and retries >= 0, finite non-negative eps_tol and backoff_s")
         if cost_metric not in ("seconds", "usd"):
             raise ValueError(f"cost_metric must be seconds or usd, not {cost_metric!r}")
         if cost_metric == "usd" and not all(isinstance(e, BlueQubitEngine) for e, _, _ in engines):
@@ -1073,9 +1075,10 @@ class Campaign:
             self.failures.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
             self.history.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
             return
-        if not math.isfinite(self._amount(r)):
-            # a NaN or inf amount would make `spent` NaN, and a NaN budget check never binds
-            msg = f"engine reported a non-finite amount {self._amount(r)!r} at {p}"
+        if not (0 <= self._amount(r) < math.inf):
+            # a NaN or inf amount would make `spent` NaN (a NaN budget check never binds), and
+            # a negative one would hand budget back
+            msg = f"engine reported an invalid amount {self._amount(r)!r} at {p}"
             tr.ladder.done, tr.ladder.stop_reason = True, msg
             self.failures.append({"circuit": cid, "method": tr.engine.method, "param": p, "error": msg})
             return
@@ -1204,7 +1207,7 @@ class Campaign:
                     vals: List[Optional[float]] = [math.nan if v is None else float(v) for v in rec["values"]]
                     deg = [bool(d) for d in (rec.get("degenerate") or [False] * n)]
                     elapsed, cost = float(rec.get("elapsed_s", 0.0)), float(rec.get("cost_usd", 0.0))
-                    if len(deg) != n or not (math.isfinite(elapsed) and math.isfinite(cost)):
+                    if len(deg) != n or not (0 <= elapsed < math.inf and 0 <= cost < math.inf):
                         raise ValueError("degenerate or amounts")
                 except (ValueError, TypeError, AttributeError):
                     malformed += 1
@@ -1475,8 +1478,8 @@ def load_day_spec(path: Path) -> Dict[str, Any]:
         nq = c.get("n_qubits")
         if nq is not None and (isinstance(nq, bool) or not isinstance(nq, int) or nq < 1):
             raise ValueError(f"circuit {cid!r}: n_qubits must be a positive integer, not {nq!r}")
-        if not c["observables"]:
-            raise ValueError(f"circuit {cid!r} has no observables")
+        if not isinstance(c["observables"], list) or not c["observables"]:
+            raise ValueError(f"circuit {cid!r} has no observables (a non-empty list is required)")
     if spec.get("deadline_utc"):
         from datetime import datetime
 
@@ -1746,6 +1749,8 @@ def _pid_alive(pid: Optional[int]) -> bool:
         return True
     try:
         cmd = Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ")
+    except PermissionError:
+        return True                             # /proc hides it (hidepid): it exists, err alive
     except OSError:
         return False
     tokens = cmd.split()  # exact argv tokens: "augurize day" is not an Augur run
@@ -1833,8 +1838,14 @@ def watch(*, armed_file: Optional[Path] = None, now: Optional[Callable[[], float
     if state_path.exists():
         try:
             loaded = json.loads(state_path.read_text())
-            if isinstance(loaded, dict):
+            ok_types = isinstance(loaded, dict) and all(
+                isinstance(loaded.get(k, v), type(v)) for k, v in fresh.items()) \
+                and isinstance(loaded.get("sent", []), list) \
+                and all(isinstance(t, (int, float)) for t in loaded.get("alerted", {}).values())
+            if ok_types:
                 st.update(loaded)
+            else:
+                st["state_reset"] = "watch_state.json had wrong field types and was reset"
         except ValueError:
             st["state_reset"] = "watch_state.json was unreadable and was reset"
     hb: Dict[str, Any] = {}
