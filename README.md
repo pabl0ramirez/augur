@@ -16,13 +16,6 @@ returns every value with an empirical error bar and a label.
 | `unconverged:<method>` | The ladder stopped before the value settled |
 | `degenerate:<method>` | The method returned a value it cannot vouch for, such as a truncated zero |
 
-## The name
-
-An augur, in ancient Rome, was a priest who read the will of the gods from signs he could observe,
-mostly the flight and calls of birds. He never saw the plan itself. He watched what was visible and
-inferred what was hidden. Augur does the same with quantum circuits. It never runs the quantum
-computer. It reads what the simulators return and infers what the ideal machine would give.
-
 ## What it does
 
 - **Engines behind one call.** Exact statevector (up to `EXACT_MAX_QUBITS` = 24, a memory choice
