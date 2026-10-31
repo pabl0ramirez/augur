@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use Augur in your work, please cite it as below."
+title: "Augur"
+abstract: >-
+  Augur estimates what an ideal quantum computer would measure, using classical
+  simulators, and tells you how far each number can be trusted. It runs more than one
+  method, climbs each up a ladder of settings until the value stops moving, and returns
+  every value with an empirical error bar and a trust label.
+type: software
+authors:
+  - family-names: "Ramirez"
+    given-names: "Pablo"
+    affiliation: "Matrix CR Studio"
+version: "0.1.0"
+date-released: "2026-10-31"
+license: "PolyForm-Noncommercial-1.0.0"
+repository-code: "https://github.com/pabl0ramirez/augur"
+keywords:
+  - quantum computing
+  - quantum simulation
+  - matrix product states
+  - Pauli propagation
+  - tensor networks
+  - Qiskit
+  - uncertainty quantification
