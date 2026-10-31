@@ -2055,7 +2055,7 @@ def _spread_report(scale, eps_tol):
 
 
 def test_tolerance_check_flags_the_duke_case():
-    # OTOCs near 1e-3 against the default 1e-2: two rungs agree within eps whatever they are
+    # values near 1e-3 against the default 1e-2 (the case Duke's review caught): two rungs agree within eps whatever they are
     rep = _spread_report(1e-3, 1e-2)
     tc = rep["tolerance_check"]
     assert tc["ok"] is False and "set eps_tol to" in tc["reason"]

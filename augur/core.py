@@ -1452,7 +1452,8 @@ _NOT_JUDGED = ("exact", "lightcone", "none")
 def tolerance_check(circuits: Dict[str, Any], eps_tol: float) -> Dict[str, Any]:
     """Is eps_tol below the scale of the values it judged? Convergence is an absolute test
     (spread of the last rungs <= eps_tol), so values that vary on a scale near eps_tol all look
-    converged whatever they are: Duke 2026-10-24, OTOCs near 1e-3 against the default 1e-2.
+    converged whatever they are. At Duke (2026-10-24) review caught, before the graded runs, that
+    the default 1e-2 would do this to the values nearest zero; the runs used 5e-4 (G1) and 1e-3 (G2).
 
     Only values a ladder produced count (the bases in Estimate: agree, <method>, disagree:..,
     unconverged:.., degenerate:..); exact and light-cone values are never judged by eps_tol,
