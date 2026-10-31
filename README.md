@@ -52,7 +52,7 @@ computer. It reads what the simulators return and infers what the ideal machine 
 ## Install and try
 
     pip install -e ".[test]"          # add ".[cloud]" for BlueQubit
-    python -m pytest -q tests/        # 217 tests
+    python -m pytest -q tests/        # 225 tests
     augur pulse                       # self-check against exact values
     augur estimate --qasm circuit.qasm --obs Z0,Z1Z2,X5
     augur bench                       # score each method on practice circuits
@@ -85,8 +85,11 @@ an answer. Scores, receipts and the full write-up are in
   repeat. At 24 qubits Augur reached the target on all 12 circuits where the top setting reached
   7, but its median cost was lower in only two repeats of the three the rule required. Results
   and the command to check them are in [benchmarks/COST_TEST_RESULT.md](benchmarks/COST_TEST_RESULT.md).
-- A seconds budget is not a hard cap. A local rung is not stopped once it starts, and in that test
-  one campaign spent 17% over its budget.
+- A seconds budget is a hard cap only with `hard_cap=True` (`augur estimate --hard-cap`). Then
+  local rungs run one at a time in a child process that is killed when the budget runs out, and the
+  killed rung is charged the time it used and gives no values. Without it a rung is not stopped
+  once it starts, and in the cost test one campaign spent 17% over its budget. The cap does not
+  apply to cloud runs, where killing a local process would not stop the job being billed.
 
 ## Prior art
 

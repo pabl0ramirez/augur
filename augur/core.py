@@ -907,13 +907,122 @@ class _Track:
     pos: int = 0
 
 
+class _OverBudget(Exception):
+    """A capped rung was killed when the budget ran out; `elapsed` is the wall time it used."""
+
+    def __init__(self, elapsed: float):
+        super().__init__(f"killed at the budget after {elapsed:.3f}s")
+        self.elapsed = elapsed
+
+
+def _rung_worker(conn) -> None:
+    """Child side of _RungWorker: import the simulators once (not charged, as in-process
+    imports never were), then run one rung per request until the pipe closes."""
+    import importlib
+
+    for mod in ("qiskit", "qiskit_aer", "pauli_prop"):
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            pass
+    conn.send("ready")
+    while True:
+        try:
+            eng, target, ops, param = conn.recv()
+        except EOFError:
+            return
+        try:
+            out = (True, eng.run(target, ops, param))
+        except Exception as e:          # SystemExit and KeyboardInterrupt end the child
+            out = (False, e)
+        try:
+            conn.send(out)
+        except Exception as e:          # an unpicklable result or exception: send its text
+            conn.send((False, RuntimeError(f"rung result could not be returned: {type(e).__name__}: {e}")))
+
+
+class _RungWorker:
+    """Runs local rungs, one at a time, in one spawned child process, so a rung can be killed
+    when the budget runs out. The Aer and pauli-prop calls used here take no time limit, so
+    killing the process is how a rung is stopped once it starts. The child is started on
+    first use (Campaign starts it before any timed call) and again after a kill or a crash;
+    its start-up (importing the simulators) is not charged. It is a daemon: it ends with the
+    parent if close() is never called."""
+
+    START_TIMEOUT_S = 300.0
+
+    def __init__(self):
+        self._proc = None
+        self._conn = None
+
+    def _start(self) -> None:
+        import multiprocessing as mp
+
+        # spawn, not fork: the parent may hold OpenMP threads from Aer, unsafe across fork
+        ctx = mp.get_context("spawn")
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(target=_rung_worker, args=(child,), daemon=True, name="augur-rung")
+        proc.start()
+        child.close()
+        try:
+            ok = parent.poll(self.START_TIMEOUT_S) and parent.recv() == "ready"
+        except (EOFError, OSError):     # the child died before it was ready
+            ok = False
+        if not ok:
+            proc.kill()
+            proc.join()
+            parent.close()
+            raise RuntimeError(f"the rung worker did not start (exit code {proc.exitcode})")
+        self._proc, self._conn = proc, parent
+
+    def ensure_started(self) -> None:
+        if self._proc is None or not self._proc.is_alive():
+            self.close()
+            self._start()
+
+    def run(self, engine: Engine, target, ops, param, limit_s: float) -> Rung:
+        """The engine's rung, or _OverBudget once `limit_s` seconds of wall time pass. An
+        exception the engine raised is re-raised here (same type and message; its traceback
+        stays in the child)."""
+        self.ensure_started()
+        t = time.perf_counter()
+        self._conn.send((engine, target, list(ops), param))
+        try:
+            ready = self._conn.poll(max(0.0, limit_s))
+            if ready:
+                ok, payload = self._conn.recv()
+        except (EOFError, OSError):
+            code = self._proc.exitcode if self._proc is not None else None
+            self.close()
+            raise RuntimeError(f"the rung worker died (exit code {code})")
+        if not ready:
+            self.close()
+            raise _OverBudget(time.perf_counter() - t)
+        if ok:
+            return payload
+        raise payload
+
+    def close(self) -> None:
+        if self._proc is not None:
+            if self._proc.is_alive():
+                self._proc.kill()
+            self._proc.join()
+        if self._conn is not None:
+            self._conn.close()
+        self._proc = self._conn = None
+
+
 class Campaign:
     """Every (circuit, method) pair is a ladder. The campaign first takes the coarsest rung of
     each, then repeatedly runs the single rung with the highest expected gain per predicted
     cost across all circuits (a first rung whose predicted cost does not fit is skipped and
     reported), until no rung's PREDICTED cost fits what is left, nothing is
     left to gain, or the wall-clock deadline passes. One rung can overshoot its prediction,
-    so `spent` can end above `budget`; the report says by how much. Budget is in seconds
+    so `spent` can end above `budget`; the report says by how much. With `hard_cap=True`
+    (a seconds budget, local engines only) every rung, the light cone included, runs in one
+    reused child process that is killed when the budget runs out: the killed rung is charged the
+    wall time it used and gives no values, and `overshoot` is then only the time taken to
+    notice and kill it. Engines and targets must pickle for that. Budget is in seconds
     (local) or credits (`cost_metric="usd"`, cloud engines only: local rungs cost no credits,
     so a credit budget would never bind on them and is refused). A rung that raises anything
     but ValueError or MemoryError is retried up to `retries` times with backoff while the
@@ -927,7 +1036,8 @@ class Campaign:
                  first_rung_guess: float = 1.0, log_path: Optional[Path] = RUN_LOG,
                  lightcone: bool = True, retries: int = 2, backoff_s: float = 5.0,
                  trust: Optional[Dict[str, float]] = None,
-                 on_step: Optional[Callable[["Campaign"], None]] = None):
+                 on_step: Optional[Callable[["Campaign"], None]] = None,
+                 hard_cap: bool = False):
         # NaN compares false with everything, so a NaN budget would never bind: refuse it
         if not (math.isfinite(budget) and budget >= 0 and math.isfinite(first_rung_guess)
                 and first_rung_guess >= 0):
@@ -947,6 +1057,21 @@ class Campaign:
             raise ValueError(f"cost_metric must be seconds or usd, not {cost_metric!r}")
         if cost_metric == "usd" and not all(isinstance(e, BlueQubitEngine) for e, _, _ in engines):
             raise ValueError("a credit budget needs cloud engines: local rungs cost 0 credits")
+        if not isinstance(hard_cap, bool):
+            raise ValueError("hard_cap must be True or False")
+        if hard_cap:
+            # killing a local process does not stop a cloud job from being billed
+            if cost_metric != "seconds" or any(isinstance(e, BlueQubitEngine) for e, _, _ in engines):
+                raise ValueError("hard_cap needs a seconds budget and local engines only")
+            import pickle
+
+            try:
+                pickle.dumps(([e for e, _, _ in engines], targets, LightConeEngine()))
+            except Exception as e:
+                raise ValueError(f"hard_cap runs rungs in a child process, so engines and targets "
+                                 f"must pickle: {type(e).__name__}: {e}") from None
+        self._worker = _RungWorker() if hard_cap else None
+        self.stopped: List[Dict[str, Any]] = []
         self.retries, self.backoff_s = retries, backoff_s
         self.trust = dict(trust or {})
         self._stop_at = math.inf
@@ -964,17 +1089,40 @@ class Campaign:
         self.tracks: List[_Track] = []
         for cid, (target, ops) in targets.items():
             if lightcone and hasattr(target, "num_qubits"):
+                if self._worker is not None:
+                    self._worker.ensure_started()       # start-up is never charged
                 t = time.perf_counter()
-                lc = LightConeEngine().run(target, ops)
-                self.lightcone[cid] = lc
-                if self.metric == "seconds":
-                    self.spent += time.perf_counter() - t
-                _logger(log_path, cid)(_rung_record(lc))
+                try:
+                    lc = self._call(LightConeEngine(), target, ops, None)
+                except _OverBudget as e:
+                    self.spent += e.elapsed
+                    self.stopped.append({"circuit": cid, "method": "lightcone", "param": None,
+                                         "amount": e.elapsed})
+                else:
+                    self.lightcone[cid] = lc
+                    if self.metric == "seconds":
+                        self.spent += time.perf_counter() - t
+                    _logger(log_path, cid)(_rung_record(lc))
             for eng, params, inv in engines:
                 self.tracks.append(_Track(cid, eng, list(params), inv, Ladder(eng.method)))
 
     def _amount(self, r: Rung) -> float:
         return r.cost_usd if self.metric == "usd" else r.elapsed_s
+
+    def _call(self, engine: Engine, target, ops, param) -> Rung:
+        """One rung: in this process, or under the hard cap in the worker, killed when what
+        is left of the budget runs out (raises _OverBudget)."""
+        if self._worker is None:
+            return engine.run(target, ops, param)
+        left = self.budget - self.spent
+        if left <= 0:
+            raise _OverBudget(0.0)
+        return self._worker.run(engine, target, ops, param, left)
+
+    def close(self) -> None:
+        """Stop the hard cap's worker process, if any. run() does this when it returns."""
+        if self._worker is not None:
+            self._worker.close()
 
     def _need(self, cid: str) -> List[int]:
         lc = self.lightcone.get(cid)
@@ -1058,8 +1206,16 @@ class Campaign:
         err: Optional[BaseException] = None
         for attempt in range(self.retries + 1):
             try:
-                r = tr.engine.run(target, [ops[i] for i in need], p)
+                r = self._call(tr.engine, target, [ops[i] for i in need], p)
                 break
+            except _OverBudget as e:         # killed at the hard cap: charge it, the budget is gone
+                self.spent += e.elapsed
+                tr.ladder.done = True
+                tr.ladder.stop_reason = f"killed at the budget after {e.elapsed:.1f}s at {p}"
+                rec = {"circuit": cid, "method": tr.engine.method, "param": p, "amount": e.elapsed}
+                self.stopped.append(rec)
+                self.history.append({**rec, "stopped": "budget"})
+                return
             except (ValueError, MemoryError) as e:   # refused or out of memory: retrying cannot help
                 err = e
                 break
@@ -1118,6 +1274,12 @@ class Campaign:
     def run(self, max_steps: int = 10_000, deadline_s: Optional[float] = None) -> Dict[str, Any]:
         """deadline_s: wall-clock seconds from now after which no new rung starts (the
         submission deadline does not move for a slow queue)."""
+        try:
+            return self._run_all(max_steps, deadline_s)
+        finally:
+            self.close()
+
+    def _run_all(self, max_steps: int, deadline_s: Optional[float]) -> Dict[str, Any]:
         stop_at = time.monotonic() + deadline_s if deadline_s is not None else math.inf
         self._stop_at = stop_at
         for tr in self.tracks:                      # bootstrap: coarsest rung everywhere
@@ -1275,6 +1437,7 @@ class Campaign:
                             for tr in self.tracks if tr.circuit == cid]}
         return {"budget": self.budget, "metric": self.metric, "spent": round(self.spent, 4),
                 "overshoot": round(max(0.0, self.spent - self.budget), 4),
+                "hard_cap": self._worker is not None, "stopped_at_budget": list(self.stopped),
                 "steps": len(self.history), "missing_estimates": missing,
                 "failures": self.failures, "circuits": circuits}
 
@@ -1305,15 +1468,18 @@ def local_engines() -> List[Tuple[Engine, Sequence[Any], bool]]:
 
 def estimate(target, ops, *, budget_s: float = 300.0, eps_tol: float = 1e-2,
              use_lightcone: bool = True, engines=None, log_path: Optional[Path] = RUN_LOG,
-             label: str = "", trust: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-    """One circuit through the campaign (light cone, then both ladders under one budget)."""
+             label: str = "", trust: Optional[Dict[str, float]] = None,
+             hard_cap: bool = False) -> Dict[str, Any]:
+    """One circuit through the campaign (light cone, then both ladders under one budget).
+    hard_cap: kill a rung when the budget runs out (see Campaign)."""
     key = label or (circuit_key(target) if hasattr(target, "num_qubits") else str(target))
     camp = Campaign({key: (target, ops)}, engines or local_engines(), budget=budget_s,
-                    eps_tol=eps_tol, log_path=log_path, lightcone=use_lightcone, trust=trust)
+                    eps_tol=eps_tol, log_path=log_path, lightcone=use_lightcone, trust=trust,
+                    hard_cap=hard_cap)
     rep = camp.run()
     c = rep["circuits"][key]
     return {"circuit": key, "estimates": c["estimates"], "ladders": c["ladders"],
-            "spent": rep["spent"]}
+            "spent": rep["spent"], "overshoot": rep["overshoot"]}
 
 
 def _logger(path: Optional[Path], key: str) -> Callable[[Dict[str, Any]], None]:
@@ -2012,6 +2178,8 @@ def _parser() -> argparse.ArgumentParser:
     e.add_argument("--qasm", type=Path, required=True)
     e.add_argument("--obs", required=True, help="comma-separated, e.g. Z0,Z1Z2,X5")
     e.add_argument("--budget-s", type=float, default=300.0)
+    e.add_argument("--hard-cap", action="store_true",
+                   help="kill a rung when the budget runs out, so spending never passes it")
     dy = sub.add_parser("day", help="run the cloud campaign on the day's circuits (spends credits)")
     dy.add_argument("--spec", type=Path, required=True)
     dy.add_argument("--confirm-spend", action="store_true",
@@ -2094,7 +2262,8 @@ def _dispatch(ap: argparse.ArgumentParser, a: argparse.Namespace) -> int:
 
         qc = QuantumCircuit.from_qasm_file(str(a.qasm))
         ops = [parse_observable(s, qc.num_qubits) for s in a.obs.split(",")]
-        print(json.dumps(estimate(qc, ops, budget_s=a.budget_s), indent=1, default=float))
+        print(json.dumps(estimate(qc, ops, budget_s=a.budget_s, hard_cap=a.hard_cap), indent=1,
+                         default=float))
     elif a.cmd == "status":
         print(json.dumps(status(), indent=1))
     elif a.cmd == "pulse":

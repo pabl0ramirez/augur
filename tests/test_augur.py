@@ -1896,3 +1896,135 @@ def test_pid_alive_errs_alive_when_proc_hides_the_process(monkeypatch):
 
     monkeypatch.setattr(Path, "read_bytes", _hidden)
     assert A._pid_alive(os.getpid()) is True
+
+
+# ── the hard cap: a rung is killed when the budget runs out ──────────────────
+class _Slow(A.Engine):
+    """Rung 1 is quick and reports 0.01 s, so the one-point guard predicts rung 2 cheap
+    (0.08 s); rung 2 then sleeps `sleep_s` and reports the time it really took. Module level,
+    so it pickles into the hard cap's worker."""
+    method = "slow"
+
+    def __init__(self, sleep_s):
+        self.sleep_s = sleep_s
+
+    def run(self, target, ops, param):
+        import time as _t
+        t = _t.perf_counter()
+        if param == 2:
+            _t.sleep(self.sleep_s)
+        took = 0.01 if param == 1 else _t.perf_counter() - t
+        return A.Rung(self.method, param, [0.1 * param for _ in ops], took,
+                      degenerate=[False] * len(ops))
+
+
+class _Refuses(A.Engine):
+    method = "refuses"
+
+    def run(self, target, ops, param):
+        raise ValueError("the engine said no")
+
+
+class _Dies(A.Engine):
+    """Kills its own process mid-rung, as an out-of-memory kill would."""
+    method = "dies"
+
+    def run(self, target, ops, param):
+        import os
+        os._exit(3)
+
+
+def _slow_campaign(sleep_s, budget, hard_cap):
+    qc, _ = _ki(n=4, steps=1)
+    return A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [(_Slow(sleep_s), [1, 2], False)],
+                      budget=budget, first_rung_guess=0.01, log_path=None, lightcone=False,
+                      hard_cap=hard_cap)
+
+
+def test_without_the_hard_cap_a_long_rung_overshoots():
+    rep = _slow_campaign(3.0, 1.0, False).run()
+    assert rep["hard_cap"] is False and rep["stopped_at_budget"] == []
+    assert rep["overshoot"] > 1.5                  # the failure the cap exists to stop
+
+
+def test_hard_cap_kills_a_rung_that_would_run_past_the_budget():
+    import time as _t
+    camp = _slow_campaign(60.0, 2.0, True)
+    t = _t.monotonic()
+    rep = camp.run()
+    assert _t.monotonic() - t < 30                 # the 60 s rung did not run to the end
+    assert rep["hard_cap"] is True
+    assert rep["overshoot"] < 0.5 and rep["spent"] < 2.5
+    [stop] = rep["stopped_at_budget"]
+    assert stop["param"] == 2 and stop["amount"] > 1.5
+    lad = rep["circuits"]["c"]["ladders"][0]
+    assert lad["rungs"] == 1 and "killed at the budget" in lad["stop"]
+    assert camp._worker._proc is None              # the killed child is gone, not left running
+
+
+def test_hard_cap_changes_nothing_when_no_rung_runs_long():
+    qc, _ = _ki(n=4, steps=1)
+    ops = [A.parse_observable("Z0", 4), A.parse_observable("Z1", 4)]
+    reps = [A.Campaign({"c": (qc, ops)}, _fake_engines(), budget=9, log_path=None,
+                       lightcone=False, hard_cap=cap).run() for cap in (False, True)]
+    assert reps[1]["circuits"] == reps[0]["circuits"]
+    assert reps[1]["spent"] == reps[0]["spent"] and reps[1]["steps"] == reps[0]["steps"]
+    assert reps[1]["stopped_at_budget"] == []
+
+
+def test_hard_cap_passes_an_engine_refusal_through():
+    qc, _ = _ki(n=4, steps=1)
+    rep = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [(_Refuses(), [1, 2], False)],
+                     budget=10, log_path=None, lightcone=False, hard_cap=True).run()
+    [f] = rep["failures"]
+    assert "ValueError: the engine said no" in f["error"]
+
+
+def test_hard_cap_with_the_real_engines_and_the_light_cone():
+    qc, _ = _ki(n=6, steps=2)
+    ops = [A.parse_observable(s, 6) for s in ("Z0", "Z2Z3", "X5")]
+    exact = A.ExactEngine().run(qc, ops).values
+    res = A.estimate(qc, ops, budget_s=60, log_path=None, hard_cap=True)
+    assert res["overshoot"] == 0.0
+    for row, want in zip(res["estimates"], exact):
+        assert abs(row["value"] - want) < 1e-2
+
+
+def test_hard_cap_refuses_what_it_cannot_cap():
+    qc, _ = _ki(n=4, steps=1)
+    targets = {"c": (qc, [A.parse_observable("Z0", 4)])}
+
+    class _Local(A.Engine):                        # defined in a function: does not pickle
+        method = "local"
+
+    with pytest.raises(ValueError, match="must pickle"):
+        A.Campaign(targets, [(_Local(), [1], False)], budget=5, log_path=None, hard_cap=True)
+    with pytest.raises(ValueError, match="local engines only"):
+        A.Campaign(targets, [(A.BlueQubitEngine(_Client([0]), "pauli-path"), [1e-3], True)],
+                   budget=5, log_path=None, lightcone=False, hard_cap=True)
+    with pytest.raises(ValueError, match="True or False"):
+        A.Campaign(targets, A.local_engines(), budget=5, log_path=None, hard_cap="yes")
+
+
+def test_hard_cap_reports_a_worker_that_dies_and_restarts_it():
+    qc, _ = _ki(n=4, steps=1)
+    camp = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, [(_Dies(), [1, 2], False)],
+                      budget=30, log_path=None, lightcone=False, hard_cap=True, retries=1,
+                      backoff_s=0.0)
+    rep = camp.run()
+    [f] = rep["failures"]
+    assert "the rung worker died (exit code 3)" in f["error"]
+    assert rep["spent"] == 0.0 and rep["stopped_at_budget"] == []
+
+
+def test_hard_cap_does_not_charge_the_worker_start_up():
+    qc, _ = _ki(n=4, steps=1)
+    camp = A.Campaign({"c": (qc, [A.parse_observable("Z0", 4)])}, A.local_engines(), budget=30,
+                      log_path=None, lightcone=True, hard_cap=True)
+    try:
+        assert "c" in camp.lightcone            # the light cone ran in the worker
+        # charged = the light cone's own time plus the pipe round trip; start-up (0.4 s warm,
+        # longer cold) would push it past this
+        assert camp.spent - camp.lightcone["c"].elapsed_s < 0.2
+    finally:
+        camp.close()
