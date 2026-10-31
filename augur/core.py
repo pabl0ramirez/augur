@@ -1439,7 +1439,56 @@ class Campaign:
                 "overshoot": round(max(0.0, self.spent - self.budget), 4),
                 "hard_cap": self._worker is not None, "stopped_at_budget": list(self.stopped),
                 "steps": len(self.history), "missing_estimates": missing,
+                "tolerance_check": tolerance_check(circuits, self.eps_tol),
                 "failures": self.failures, "circuits": circuits}
+
+
+#: eps_tol must be at least this many times below the spread of the values it judges
+TOL_MARGIN = 10.0
+#: bases eps_tol never judged: exact values, and rows with no estimate
+_NOT_JUDGED = ("exact", "lightcone", "none")
+
+
+def tolerance_check(circuits: Dict[str, Any], eps_tol: float) -> Dict[str, Any]:
+    """Is eps_tol below the scale of the values it judged? Convergence is an absolute test
+    (spread of the last rungs <= eps_tol), so values that vary on a scale near eps_tol all look
+    converged whatever they are: Duke 2026-10-24, OTOCs near 1e-3 against the default 1e-2.
+
+    Only values a ladder produced count (the bases in Estimate: agree, <method>, disagree:..,
+    unconverged:.., degenerate:..); exact and light-cone values are never judged by eps_tol,
+    and large ones would hide small ladder values. The scale is the standard deviation of those
+    values, or |value| when there is only one. It is a spread, not a magnitude, because the
+    score is a correlation across observables: values that hardly vary cannot be told apart by
+    a tolerance their spread does not clear. `ok` needs eps_tol * TOL_MARGIN <= scale.
+    `near_zero` lists the values a ladder settled (agree, or a plain method name: one method
+    converged) with |value| <= eps_tol: their convergence cannot tell them from zero.
+    Reported, never enforced: the caller decides."""
+    if isinstance(eps_tol, bool) or not isinstance(eps_tol, (int, float)) \
+            or not (0 <= eps_tol < math.inf):
+        raise ValueError(f"eps_tol must be finite and non-negative, not {eps_tol!r}")
+    vals, near = [], []
+    for cid, c in circuits.items():
+        for row in c["estimates"]:
+            v, basis = row.get("value"), str(row.get("basis", "none"))
+            if basis in _NOT_JUDGED or not isinstance(v, (int, float)) or not math.isfinite(v):
+                continue
+            vals.append(float(v))
+            if (basis == "agree" or ":" not in basis) and abs(v) <= eps_tol:
+                near.append({"circuit": cid, "index": row.get("index"), "value": v, "basis": basis})
+    base = {"eps_tol": eps_tol, "margin": TOL_MARGIN, "judged": len(vals), "near_zero": near}
+    if not vals:
+        return {**base, "scale": None, "ok": None,
+                "reason": "no ladder values to measure a scale on (every value exact, or none)"}
+    scale = float(np.std(vals)) if len(vals) > 1 else abs(vals[0])
+    ok = eps_tol * TOL_MARGIN <= scale
+    if ok:
+        reason = f"eps_tol {eps_tol:g} is at least {TOL_MARGIN:g}x below the spread of the values ({scale:.3g})"
+    elif scale == 0:
+        reason = "the ladder values do not vary at all: no tolerance can tell them apart"
+    else:
+        reason = (f"eps_tol {eps_tol:g} is not {TOL_MARGIN:g}x below the spread of the values "
+                  f"({scale:.3g}): set eps_tol to {scale / TOL_MARGIN:.2g} or less and rerun")
+    return {**base, "scale": scale, "ok": ok, "reason": reason}
 
 
 def _slice_ladder(lad: Ladder, i: int) -> Ladder:
@@ -1479,7 +1528,8 @@ def estimate(target, ops, *, budget_s: float = 300.0, eps_tol: float = 1e-2,
     rep = camp.run()
     c = rep["circuits"][key]
     return {"circuit": key, "estimates": c["estimates"], "ladders": c["ladders"],
-            "spent": rep["spent"], "overshoot": rep["overshoot"]}
+            "spent": rep["spent"], "overshoot": rep["overshoot"],
+            "tolerance_check": rep["tolerance_check"]}
 
 
 def _logger(path: Optional[Path], key: str) -> Callable[[Dict[str, Any]], None]:
@@ -2244,7 +2294,7 @@ def _dispatch(ap: argparse.ArgumentParser, a: argparse.Namespace) -> int:
         rep = run_day(load_day_spec(a.spec), bluequbit.init(key), out_dir=a.out_dir, resume=a.resume)
         print(json.dumps({k: rep[k] for k in ("spent", "overshoot", "steps", "missing_estimates",
                                               "failures", "report_path", "submission_path", "missing",
-                                              "restored_rungs")},
+                                              "restored_rungs", "tolerance_check")},
                          indent=1, default=float))
         return 0
     if a.cmd == "bench":

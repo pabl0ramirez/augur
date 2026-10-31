@@ -2028,3 +2028,79 @@ def test_hard_cap_does_not_charge_the_worker_start_up():
         assert camp.spent - camp.lightcone["c"].elapsed_s < 0.2
     finally:
         camp.close()
+
+
+# ── the tolerance check: is eps_tol below the scale of the values it judged? ─
+class _Spread(A.Engine):
+    """Observable k settles at scale * (k + 1), each rung closer by half: values whose spread
+    across observables is `scale`-sized."""
+
+    def __init__(self, method, scale):
+        self.method, self.scale = method, scale
+
+    def run(self, target, ops, param):
+        k = int(param) - 19
+        return A.Rung(self.method, param, [self.scale * (j + 1) + self.scale * 0.1 / 2 ** k
+                                           for j in range(len(ops))], 0.1,
+                      degenerate=[False] * len(ops))
+
+
+def _spread_report(scale, eps_tol):
+    qc, _ = _ki(n=4, steps=1)
+    ops = [A.parse_observable(s, 4) for s in ("Z0", "Z1", "Z2", "Z3")]
+    engines = [(_Spread("pps", scale), list(range(20, 40)), False),
+               (_Spread("mps", scale), list(range(20, 40)), False)]
+    return A.Campaign({"c": (qc, ops)}, engines, budget=50, log_path=None, lightcone=False,
+                      eps_tol=eps_tol).run()
+
+
+def test_tolerance_check_flags_the_duke_case():
+    # OTOCs near 1e-3 against the default 1e-2: two rungs agree within eps whatever they are
+    rep = _spread_report(1e-3, 1e-2)
+    tc = rep["tolerance_check"]
+    assert tc["ok"] is False and "set eps_tol to" in tc["reason"]
+    assert len(tc["near_zero"]) == 4                    # every observable settled below eps
+    assert all(r["basis"] == "agree" for r in tc["near_zero"])
+
+
+def test_tolerance_check_passes_a_tolerance_below_the_scale():
+    tc = _spread_report(0.1, 1e-3)["tolerance_check"]
+    assert tc["ok"] is True and tc["near_zero"] == []
+    assert tc["scale"] == pytest.approx(np.std([0.1, 0.2, 0.3, 0.4]), rel=1e-2)
+
+
+def test_tolerance_check_never_lists_exact_or_light_cone_values():
+    circuits = {"c": {"estimates": [
+        {"index": 0, "value": 0.0, "basis": "lightcone"},
+        {"index": 1, "value": 1e-4, "basis": "exact"},
+        {"index": 2, "value": 5e-3, "basis": "mps"},
+        {"index": 3, "value": 2e-3, "basis": "unconverged:pps"},
+        {"index": 4, "value": math.nan, "basis": "none"}]}}
+    tc = A.tolerance_check(circuits, 1e-2)
+    assert [r["index"] for r in tc["near_zero"]] == [2]     # only the ladder-settled one
+    assert tc["ok"] is False
+
+
+def test_tolerance_check_with_no_values_says_so():
+    tc = A.tolerance_check({"c": {"estimates": [{"index": 0, "value": math.nan, "basis": "none"}]}}, 1e-2)
+    assert tc["ok"] is None and "no ladder values" in tc["reason"]
+
+
+def test_tolerance_check_is_not_masked_by_large_exact_values():
+    # exact values spread widely; the ladder values eps_tol judged sit near 1e-3
+    rows = [{"index": i, "value": v, "basis": "exact"} for i, v in enumerate([-0.9, 0.0, 0.9])]
+    rows += [{"index": 3 + i, "value": v, "basis": "agree"} for i, v in enumerate([1e-3, 2e-3, 3e-3])]
+    tc = A.tolerance_check({"c": {"estimates": rows}}, 1e-2)
+    assert tc["judged"] == 3 and tc["ok"] is False and len(tc["near_zero"]) == 3
+
+
+def test_tolerance_check_on_values_that_do_not_vary():
+    rows = [{"index": i, "value": 0.5, "basis": "agree"} for i in range(3)]
+    tc = A.tolerance_check({"c": {"estimates": rows}}, 1e-3)
+    assert tc["ok"] is False and tc["scale"] == 0.0 and "do not vary" in tc["reason"]
+
+
+@pytest.mark.parametrize("bad", [-1e-3, math.nan, math.inf, True, "0.01"])
+def test_tolerance_check_refuses_a_bad_tolerance(bad):
+    with pytest.raises(ValueError, match="eps_tol"):
+        A.tolerance_check({}, bad)

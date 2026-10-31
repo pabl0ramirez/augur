@@ -33,7 +33,12 @@ computer. It reads what the simulators return and infers what the ideal machine 
   Pauli path. A value is converged when the last rungs (2 for MPS, 3 for Pauli path) all lie within
   `eps_tol` of each other (default 1e-2, set per run with `eps_tol` in the day spec); `sigma` is that
   max minus min spread. Set `eps_tol` below the scale of your values, or tiny values will look
-  converged.
+  converged. A campaign report, and the output of `estimate` and `day`, carries a
+  `tolerance_check`. It measures that scale as the spread (standard deviation) of the values the
+  ladders produced, or the size of the value when there is only one, leaving out exact and
+  light-cone values. It says whether `eps_tol` is at least ten times below that spread and what to
+  set if not, and lists each value a ladder settled within `eps_tol` of zero. It reports and
+  never blocks.
 - **Fusion.** Per observable, exact beats light cone beats ladders. Converged methods are averaged
   by inverse variance. If two converged methods differ by more than 3 combined sigmas, the tighter
   one is kept, sigma becomes the gap, and the value is labelled `disagree`.
@@ -52,7 +57,7 @@ computer. It reads what the simulators return and infers what the ideal machine 
 ## Install and try
 
     pip install -e ".[test]"          # add ".[cloud]" for BlueQubit
-    python -m pytest -q tests/        # 225 tests
+    python -m pytest -q tests/        # 236 tests
     augur pulse                       # self-check against exact values
     augur estimate --qasm circuit.qasm --obs Z0,Z1Z2,X5
     augur bench                       # score each method on practice circuits
