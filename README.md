@@ -52,7 +52,7 @@ computer. It reads what the simulators return and infers what the ideal machine 
 ## Install and try
 
     pip install -e ".[test]"          # add ".[cloud]" for BlueQubit
-    python -m pytest -q tests/        # 187 tests
+    python -m pytest -q tests/        # 217 tests
     augur pulse                       # self-check against exact values
     augur estimate --qasm circuit.qasm --obs Z0,Z1Z2,X5
     augur bench                       # score each method on practice circuits
@@ -80,8 +80,13 @@ an answer. Scores, receipts and the full write-up are in
 - The watchdog identifies a run through `/proc`, so it is exact on Linux. On macOS any process
   with the run's PID counts as alive, which can delay a restart but never starts a second paid
   run. It refuses to run on Windows.
-- Whether Augur's budget planning costs less than running everything at the top setting has not
-  been measured yet. We make no savings claim until a pre-registered test supports one.
+- Augur makes no savings claim. A pre-registered test against running every circuit once at the
+  top MPS setting found none at 18 or 24 qubits. At 18 qubits the top setting was faster on every
+  repeat. At 24 qubits Augur reached the target on all 12 circuits where the top setting reached
+  7, but its median cost was lower in only two repeats of the three the rule required. Results
+  and the command to check them are in [benchmarks/COST_TEST_RESULT.md](benchmarks/COST_TEST_RESULT.md).
+- A seconds budget is not a hard cap. A local rung is not stopped once it starts, and in that test
+  one campaign spent 17% over its budget.
 
 ## Prior art
 
